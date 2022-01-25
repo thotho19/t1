@@ -1,0 +1,318 @@
+<!doctype html>
+<html>
+<head>
+  <script src="jquery-latest.min.js"></script>
+  <script src="d3.v3.min.js" charset="utf-8"></script>
+  <script src="d3-timeline.js"></script>
+
+  <style type="text/css">
+    .axis path,
+    .axis line {
+      fill: none;
+      stroke: black;
+      shape-rendering: crispEdges;
+    }
+
+    .axis text {
+      font-family: sans-serif;
+      font-size: 10px;
+    }
+
+    .timeline-label {
+      font-family: sans-serif;
+      font-size: 12px;
+    }
+
+    #rightBox {
+      position: fixed;
+      top: 0;
+      right: 0;
+      width: 350px;
+      background-color: rgba(255, 255, 255, 0.7);
+    }
+
+    #eventListBox {
+      height: 400px;
+      overflow-y: scroll;
+    }
+
+    .coloredDiv {
+      height:20px; width:20px; float:left;
+    }
+
+    #eventList {
+      list-style-type: none;
+      padding-left: 0;
+    }
+
+    #mousedMessage {
+      height: 100%;
+      overflow-y: visible;
+    }
+
+    rect.moused-over {
+      fill: lightgrey !important;
+    }
+  </style>
+  <script type="text/javascript">
+
+    const timeFmt = d3.time.format("%H:%M:%S.%L");
+    var preparedData, stall_series;
+    var offset;
+    var pinnedSession;
+    var mousedElement;
+
+    const msgTypeToColor = new Map();
+    msgTypeToColor.set('receive', '#aec7e8');
+    msgTypeToColor.set('send', '#1f77b4');
+    msgTypeToColor.set('peer-disconnect', '#ff7f0e');
+    msgTypeToColor.set('session-error', '#d62728');
+    msgTypeToColor.set('session-start', '#2ca02c');
+    msgTypeToColor.set('connect', '#98df8a');
+    msgTypeToColor.set('session-end', '#8c564b');
+    msgTypeToColor.set('tcp-overflow', '#e377c2');
+    msgTypeToColor.set('io-timeout', '#9467bd');
+    msgTypeToColor.set('warn', '#ffbb78');
+
+    const sessionsPerIpAddress = new Map();
+
+    function colorForMsg(msgType) {
+      let color = msgTypeToColor.get(msgType);
+      return color ? color : '#bcbd22';
+    }
+
+    function msgTypeSortIndex(msgType) {
+      return msgType == "receive" ? 0 : 1;
+    }
+
+    class StallCalculator {
+
+      constructor() {
+        this.first_time = Number.MAX_SAFE_INTEGER;
+        this.last_time = 0;
+        this.stall_bucket_ms = 1000;
+      }
+
+      updateBounds(d) {
+        this.first_time = Math.min(d.times[0].starting_time, this.first_time);
+        this.last_time = Math.max(d.times[d.times.length-1].ending_time, this.last_time);
+      }
+
+      createBuckets() {
+        this.stall_buckets = new Array(Math.ceil((this.last_time - this.first_time)/this.stall_bucket_ms)).fill([]);
+      }
+
+      addEvent(d, event) {
+        let stall_bucket = Math.floor((event.starting_time - this.first_time) / this.stall_bucket_ms);
+        if (this.stall_buckets[stall_bucket].length == 0) {
+          this.stall_buckets[stall_bucket] = [];
+        }
+        this.stall_buckets[stall_bucket].push(d);
+      }
+
+      createStallSeries() {
+        let max_stall = Math.max.apply(Math, this.stall_buckets.map((b) => b.length));
+        let grey = d3.scale.linear().range([0.1, 1]).domain([0, max_stall]);
+        let stalls = this.stall_buckets.map((stalls, i) => {
+          let starting_time = this.first_time + (i * this.stall_bucket_ms);
+          let opacity = Math.round(grey(stalls.length) * 100) / 100;
+          return {
+            starting_time: starting_time,
+            ending_time: starting_time + this.stall_bucket_ms,
+            stalled_series: stalls,
+            color: 'rgba(0,0,0,' + opacity + ')'
+          }
+        }).filter((d) => d.stalled_series.length >= 5);
+        return {times: stalls};
+      }
+    }
+
+    function prepare(data) {
+      const stall_calculator = new StallCalculator();
+      data.forEach((d) => {
+        let dropTime = d.times.find((e) => e.msgType == "peer-disconnect" || e.msgType == "session-end");
+        d.disconnect_time = dropTime == null ? 0 : dropTime.starting_time;
+        d.times.sort((a, b) => a.starting_time - b.starting_time);
+        stall_calculator.updateBounds(d);
+      });
+      stall_calculator.createBuckets();
+      data.forEach((d) => {
+        let last_ending_time = 0;
+        d.max_gap = 0;
+        d.last_gap_time = 0;
+        d.total_gap_time = 0;
+        d.times.forEach((event) => {
+          event.color = colorForMsg(event.msgType);
+          if (last_ending_time) {
+            let gap = event.starting_time - last_ending_time;
+            d.max_gap = Math.max(d.max_gap, gap);
+            if (gap > 100) {
+              d.last_gap_time = last_ending_time;
+            }
+            if (gap > 1000 || (event.msgType == 'send' && (event.ending_time - event.starting_time) > 1000)) {
+              stall_calculator.addEvent(d, event);
+            }
+            d.total_gap_time += gap;
+          }
+          last_ending_time = event.ending_time;
+        });
+        d.timesByStartTime = d.times.slice();
+        d.times.sort((a, b) => msgTypeSortIndex(a.msgType) - msgTypeSortIndex(b.msgType));
+        let ipAddress = d.socket.split(':')[0];
+        let sessionCount = sessionsPerIpAddress.get(ipAddress);
+        sessionsPerIpAddress.set(ipAddress, sessionCount ? sessionCount + 1 : 1);
+      });
+
+      data = data.filter((d) => d.max_gap > 10);
+//      data = data.sort((a, b) => a.disconnect_time > b.disconnect_time);
+      data = data.sort((a, b) => a.last_gap_time - b.last_gap_time);
+
+      return {
+        preparedData: data,
+        stall_series: stall_calculator.createStallSeries()
+      }
+    }
+
+    function formatEvent(d) {
+      const lifespan = d.ending_time - d.starting_time;
+      return timeFmt(new Date(d.starting_time)) + " <span style=\"color: " + colorForMsg(d.msgType) + "\">" + d.msgType + "</span> (" + lifespan + "ms) " + d.summary
+    }
+
+    function plot(data, startIndex, count = 1000) {
+      offset = startIndex;
+      const width = 1000;
+      const chart = d3.timeline()
+        .width(width * 4)
+        .stack()
+        .tickFormat({
+          format: d3.time.format("%H:%M"),
+          tickTime: d3.time.minutes,
+          tickInterval: 1,
+          tickSize: 6
+        })
+        .itemHeight(5)
+        .itemMargin(2)
+        .showAxisTop()
+        .showTimeAxisTick()
+        .margin({left: 10, right: 30, top: 30, bottom: 0})
+        .hover(function (d, i, datum) {
+          if (pinnedSession) {
+            return;
+          }
+          // d is the current rendering object
+          // i is the index during d3 rendering
+          // datum is the id object
+          d3.selectAll("#eventList li").remove();
+          mousedElement = event.currentTarget;
+          mousedElement.classList.add("moused-over");
+
+          const div = $('#hoverRes');
+          if (datum.socket) {
+            let hoverIndex = datum.timesByStartTime.indexOf(d);
+            let firstIndex = Math.max(0, hoverIndex - 3);
+            let lastIndex = Math.min(datum.timesByStartTime.length, hoverIndex + 3);
+            let closeTimes = datum.timesByStartTime.slice(firstIndex, lastIndex);
+
+            document.getElementById('mousedMessage').src = window.location.origin + d.src;
+            document.getElementById('lastGapTime').textContent = timeFmt(new Date(datum.last_gap_time)) + " (" + datum.total_gap_time + ")";
+
+            const ipAddress = datum.socket.split(':')[0];
+
+            div.find('#socket').html(datum.socket + " (<a href=\"#\" onclick=\"showSessionsForIp('" + ipAddress + "')\">" + sessionsPerIpAddress.get(ipAddress) + "</a> sessions)");
+            d3.select("#eventList")
+              .selectAll()
+              .data(closeTimes)
+              .enter()
+              .append("li")
+              .html(formatEvent)
+              .style('font-weight', (dd) => dd == d ? 'bold' : 'normal');
+          } else {
+            div.find('#socket').html(d.stalled_series.length + " stalls starting (<a href=\"#\" onclick=\"showSessionsForStall('" + '' + "')\">" + "from " + timeFmt(new Date(d.starting_time)) + "</a>)");
+
+            document.getElementById('mousedMessage').src = "";
+            document.getElementById('lastGapTime').textContent = "";
+          }
+        })
+        .mouseout(function (d) {
+          if (!pinnedSession) {
+            mousedElement.classList.remove("moused-over");
+            mousedElement = null;
+          }
+        })
+        .click(function (d, i, datum) {
+          if (datum.socket) {
+            pinnedSession = datum.socket;
+            document.getElementById("sessionPin").style.visibility = 'visible';
+          } else {
+            plot(d.stalled_series, 0)
+          }
+        });
+
+      const slice = data.slice(offset, offset + count);
+      slice.splice(0, 0, stall_series);
+      d3.select("#timeline3").selectAll("svg").remove();
+      const svg = d3.select("#timeline3").append("svg").attr("width", width * 4)
+        .datum(slice).call(chart);
+    }
+
+    function showSessionsForIp(ipAddress) {
+      let ipPrefix = ipAddress + ":";
+      let sessionsForIp = preparedData.filter((d) => d.socket.startsWith(ipPrefix));
+      plot(sessionsForIp, 0);
+    }
+
+    function unPinSession() {
+      pinnedSession = null;
+      document.getElementById("sessionPin").style.visibility = 'hidden';
+      mousedElement.classList.remove("moused-over");
+      mousedElement = null;
+    }
+
+    function reqListener() {
+      const data = JSON.parse(this.responseText);
+      ({ preparedData, stall_series } = prepare(data));
+      plot(preparedData, 0);
+    }
+
+    function navigateBy(increment) {
+      plot(preparedData, Math.max(0, offset + increment));
+    }
+
+    function reqError(err) {
+      console.log('Fetch Error :-S', err);
+    }
+
+    const oReq = new XMLHttpRequest();
+    oReq.onload = reqListener;
+    oReq.onerror = reqError;
+    oReq.open('get', '/timeline.json', true);
+    oReq.send();
+
+  </script>
+</head>
+<body>
+  <div>
+    <div id="timeline3"></div>
+  </div>
+  <div id="rightBox">
+    <div>
+      <a href="#" onclick="navigateBy(-preparedData.length)">|&lt;&lt;</a>
+      <a href="#" onclick="navigateBy(-1000)">&lt;</a>
+      <a href="#" onclick="navigateBy(1000)">&gt;</a>
+      <a href="#" onclick="navigateBy(preparedData.length-1000)">&gt;&gt;|</a>
+    </div>
+    <div id="hoverRes">
+      <div class="coloredDiv"></div>
+      <div>
+        <span id="socket"></span>
+        <span id="sessionPin" onclick="unPinSession()" style="visibility: hidden">X</span>
+      </div>
+    </div>
+    <div id="eventListBox">
+      <ol id="eventList"></ol>
+      <div id="lastGapTime"></div>
+      <iframe id="mousedMessage" src="" frameborder="0"></iframe>
+    </div>
+  </div>
+</body>
+</html>
